@@ -1,0 +1,442 @@
+
+<!DOCTYPE html>
+<html>
+<!--
+  IAmContent Public Libraries.
+  Copyright (C) 2016 Greg Elderfield
+  @author Greg Elderfield, support@jarchitect.co.uk
+ 
+  This program is free software; you can redistribute it and/or modify it under the terms of the
+  GNU General Public License as published by the Free Software Foundation; either version 2 of 
+  the License, or (at your option) any later version.
+  This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+  See the GNU General Public License for more details.
+  You should have received a copy of the GNU General Public License along with this program;
+  if not, write to the Free Software Foundation, Inc., 
+  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+-->
+<head>
+<meta charset="utf-8" />
+<script src="http://static.robotwebtools.org/EventEmitter2/current/eventemitter2.min.js"></script>
+<script src="http://static.robotwebtools.org/roslibjs/current/roslib.min.js"></script>
+<script src="https://d3js.org/d3.v4.min.js"></script>
+<script src="http://code.jquery.com/jquery-1.4.4.min.js"></script>
+<script type="text/javascript" src="https://www.gstatic.com/charts/loader.js"></script>
+<script>
+	// Set your IP address here:
+	var ROBOT_IP_ADDRESS = "192.168.1.158";
+	var MAX_VEL = 0.12;
+	var MAX_OMEGA = 2.0;
+	var MAX_IMU_OMEGA = 5.0;
+	var GUAGE_ANIMATION_CONFIG = {duration: 10}; // milliseconds
+	var LONGEST_MAP_SIDE = 400;
+	
+	// A Guage class
+	function Guage(id, options) {
+		this.options = options;
+		this.data = google.visualization.arrayToDataTable([['Label', 'Value'], [options.label, 0.0]]);
+		this.guage = new google.visualization.Gauge($("#" + id)[0]);
+		this.setValue = function(v) {
+			this.data.setValue(0, 1, v);
+			this.guage.draw(this.data, this.options);
+		};
+	}
+	var velGuage = null;
+	var omegaGuage = null;
+	var imuGuage = null;
+	var dx = 10;
+	var dy = 10;
+
+	// On page load..
+	$(function() {
+	
+		// Manage the ROS connection
+		var ros = new ROSLIB.Ros();
+	
+		ros.on('error', function(error) {
+			$('#connecting').hide();
+			$('#connected').hide();
+			$('#closed').hide();
+			$('#error').show();
+			console.log(error);
+		});
+	
+		ros.on('connection', function() {
+			console.log('Connection made!');
+			$('#connecting').hide();
+			$('#error').hide();
+			$('#closed').hide();
+			$('#connected').show();
+		});
+	
+		ros.on('close', function() {
+			console.log('Connection closed.');
+			$('#connecting').hide();
+			$('#connected').hide();
+			$('#closed').show();
+		});
+	
+		ros.connect("ws://" + ROBOT_IP_ADDRESS + ":9090");
+		
+		
+		// Create the Guages
+		google.charts.load('current', {'packages':['gauge']});
+		google.charts.setOnLoadCallback(initGuages);
+		
+		var GUAGE_SIZE = 150;
+        var velGuageOptions = {
+        	label: "V",
+            animation: GUAGE_ANIMATION_CONFIG,
+	        width: GUAGE_SIZE, height: GUAGE_SIZE,
+	        yellowFrom:0.7*MAX_VEL, yellowTo: 0.8*MAX_VEL,
+	        redFrom: 0.8*MAX_VEL, redTo: MAX_VEL,
+	        min: 0.0, max: MAX_VEL
+        };
+        var omegaGuageOptions = {
+            label: "w",
+            animation: GUAGE_ANIMATION_CONFIG,
+            animation: {duration: 50},
+	        width: GUAGE_SIZE, height: GUAGE_SIZE,
+	        min: MAX_OMEGA, max: -MAX_OMEGA              // Note the reversed direction to match our robot coordinate frame
+        };
+        var imuGuageOptions = {
+                label: "w",
+                animation: GUAGE_ANIMATION_CONFIG,
+    	        width: GUAGE_SIZE, height: GUAGE_SIZE,
+    	        min: MAX_IMU_OMEGA, max: -MAX_IMU_OMEGA  // Note the reversed direction to match our robot coordinate frame
+            };
+        
+		function initGuages() {
+			velGuage = new Guage("vel-guage-holder", velGuageOptions);
+			omegaGuage = new Guage("omega-guage-holder", omegaGuageOptions);
+			imuGuage = new Guage("imu-guage-holder", imuGuageOptions);
+
+			velGuage.setValue(0.0);
+			omegaGuage.setValue(0.0);
+			imuGuage.setValue(0.0);
+		}
+		
+		
+		// Build the tag table
+		var TAG_COUNT = 16;
+		for (var v=0; v<TAG_COUNT; v++) {
+			$("#tag-data").append(
+					"<tr id='tag-" + v + "'>" 
+		              + "<th class='tag-id'>" + v + "</th>"
+		              + "<td class='tag-num-val' id='num-val-position-x-" + v + "'></td>"
+		              + "<td class='tag-num-val' id='num-val-position-y-" + v + "'></td>"
+		              + "<td class='tag-num-val' id='num-val-position-z-" + v + "'></td>"
+		              + "<td class='tag-num-val' id='num-val-orientation-x-" + v + "'></td>"
+		              + "<td class='tag-num-val' id='num-val-orientation-y-" + v + "'></td>"
+		              + "<td class='tag-num-val' id='num-val-orientation-z-" + v + "'></td>"
+		              + "<td class='tag-num-val' id='num-val-orientation-w-" + v + "'></td>"
+				  + "</tr>");
+		}
+		
+		// Monitor the tag detection data
+		var tagData = new ROSLIB.Topic({
+			ros : ros,
+			name : '/camera/tag_detections',
+			messageType : 'apriltags_ros/AprilTagDetectionArray'
+		});
+	
+		var PRECISION = 1000.0;
+		function precis(x) {
+			return Math.round(x * PRECISION) / PRECISION;
+		}
+		
+		tagData.subscribe(function(message) {
+			function displayTagData(tag) {
+				var tagId = tag.id;
+				var pose = tag.pose.pose;
+				var position = pose.position;
+				var orientation = pose.orientation;
+				$("#num-val-position-x-" + tagId).text(precis(position.x));
+				$("#num-val-position-y-" + tagId).text(precis(position.y));
+				$("#num-val-position-z-" + tagId).text(precis(position.z));
+				$("#num-val-orientation-x-" + tagId).text(precis(orientation.x));
+				$("#num-val-orientation-y-" + tagId).text(precis(orientation.y));
+				$("#num-val-orientation-z-" + tagId).text(precis(orientation.z));
+				$("#num-val-orientation-w-" + tagId).text(precis(orientation.w));
+			}
+			$("#tag-data .tag-num-val").text(""); // Clear all data
+			// Write tag data
+			var tags = message.detections;
+			for (var t=0; t<tags.length; t++)
+				displayTagData(tags[t]);
+		});
+		
+		// Monitor the tag detection images
+		$("#tag-detections").attr("src", "http://" + ROBOT_IP_ADDRESS + ":8080/stream?topic=/camera/tag_detections_image?invert=true");
+		
+		// Monitor the commanded velocity topic
+		var cmdVel = new ROSLIB.Topic({
+			ros : ros,
+			name : '/cmd_vel',
+			messageType : 'geometry_msgs/Twist'
+		});
+	
+		cmdVel.subscribe(function(message) {
+			velGuage.setValue(message.linear.x);
+			omegaGuage.setValue(message.angular.z);
+		});
+		
+		// Monitor the IMU topic
+		var imu = new ROSLIB.Topic({
+			ros : ros,
+			name : '/imu',
+			messageType : 'sensor_msgs/Imu'
+		});
+	
+		imu.subscribe(function(message) {
+			imuGuage.setValue(message.angular_velocity.z);
+		});
+		
+		// Monitor the Occupancy Grid and April Tags Topic
+		var occupancyGrid = new ROSLIB.Topic({
+			ros : ros,
+			name : '/map',
+			messageType : 'nav_msgs/OccupancyGrid'
+		});
+		var aprilTagsPoses = new ROSLIB.Topic({
+			ros : ros,
+			name : '/aprilTagPoses',
+			messageType : 'geometry_msgs/PoseArray'
+		});
+		var estimatedPose = new ROSLIB.Topic({
+			ros : ros,
+			name : '/estimatedPose',
+			messageType : 'geometry_msgs/Pose'
+		});
+		
+		// Drawing the Occupancy Grid
+		function drawGrid(rows, cols, tileLength, occupancyPercentages) {
+			var gridSvg = d3.select("#occupancy-grid");
+			gridSvg.selectAll("*").remove();
+			for (var y=0; y<rows; y++) {
+				var occupancyRow = rows - y - 1; // Flip the rows vertically
+				var rowStartIndex = occupancyRow * cols;
+				for (var x=0; x<cols; x++) {
+					var occupancyIndex = rowStartIndex + x;
+					var occupancyProbability = occupancyPercentages[occupancyIndex]/100.0;
+					gridSvg.append("rect")
+						.attr("x", x * tileLength)
+						.attr("y", y * tileLength)
+						.attr("width", tileLength)
+						.attr("height", tileLength)
+						.attr("opacity", occupancyProbability);
+				}
+			}
+		}
+		
+		function scaleRealWorld(pixelsPerMetre) {
+			d3.select("#real-world").attr("transform", "scale(" + pixelsPerMetre + ")");
+		}
+		
+		var mapHeightInMetres = -1;
+		
+		function flipY(yMetres) {
+			return mapHeightInMetres - yMetres; // Flip the y-coordinate between real-world and SVG values.
+		}
+		
+		function asDegrees(radians) {
+			return precis(radians * 180.0 / Math.PI);
+		}
+
+		function asTransform(pose) {
+			return "translate(" + pose.position.x + "," + flipY(pose.position.y) + ") "
+                 + "rotate(" + (-asDegrees(pose.orientation.z)) + ")";
+		}
+		
+		function poseDescription(pose) {
+			return "(" + pose.position.x + "," + pose.position.y + "), rotated by " + pose.orientation.z + " radians (" + asDegrees(pose.orientation.z) + " degrees).";
+		}
+		// Drawing the April Tags
+		function drawAprilTags(message) {
+			var aprilTagsSvg = d3.select("#april-tags");
+			aprilTagsSvg.selectAll("*").remove();
+			aprilTagsSvg.selectAll("use").data(message.poses)
+				.enter().append("use")
+					.attr("xlink:href", "#april-tag-def")
+					.attr("id", function(pose, index) {return "april-tag-" + index})
+					.attr("transform", asTransform)
+				.append("title").text(function(pose, index) {return "April tag index " + index + ", located at " + poseDescription(pose)});
+		}
+
+		// Re-posing the robot
+		function reposeRobot(pose) {
+			var robot = d3.select("#robot");
+			robot.attr("transform", asTransform(pose));
+			robot.select("title").text("Robot estimated at " + poseDescription(pose));
+
+		}
+		
+		var mapSubscriptionsHaveBeenCreated = false;
+		
+		function drawMap(message) {
+			var occupancyPercentages = message.data;
+			var rows = message.info.height;
+			var cols = message.info.width;
+			var aspectRatio = cols / rows;
+			var isPortrait = aspectRatio < 1.0;
+			var width = isPortrait ? LONGEST_MAP_SIDE * aspectRatio : LONGEST_MAP_SIDE;
+			var height = isPortrait ? LONGEST_MAP_SIDE : LONGEST_MAP_SIDE / aspectRatio;
+			var tileLength = width / cols;
+			var resolution = message.info.resolution;
+			var pixelsPerMetre = tileLength/resolution;
+			
+			d3.select("svg#map")
+				.attr("width", width)
+				.attr("height", height);
+			
+			d3.select("#no-map-message").remove();
+			
+			drawGrid(rows, cols, tileLength, occupancyPercentages);
+			
+			scaleRealWorld(pixelsPerMetre);
+			
+			// Only subscribe to the other map topics once the map height is known (we need to know this so that we can flip the y-coordinates when drawing other details).
+			mapHeightInMetres = rows * resolution;
+			if (!mapSubscriptionsHaveBeenCreated) {
+				aprilTagsPoses.subscribe(drawAprilTags); 
+				mapSubscriptionsHaveBeenCreated = true;
+			}
+		};
+		
+		occupancyGrid.subscribe(drawMap);
+		estimatedPose.subscribe(reposeRobot);
+		
+		// For dev testing
+		//drawMap({info: {height : 8, resolution : 0.20000000298023224, width : 4}, data: [100, 0, 100, 100,100, 0, 0, 100,100, 100, 0, 100,100, 0, 0, 100,100, 0, 100, 100,100, 0, 0, 100,100, 100, 0, 100,0, 100, 0, 100] });
+		//drawAprilTags({poses: [{position:{x:0.3,y:0.5}, orientation: {z:1.570796}}, {position:{x:0.6,y:0.3}, orientation: {z:0.0}}] });
+		//reposeRobot({position:{x:0.3,y:0.2}, orientation: {z:1.570796}});
+	});
+</script>
+<style type="text/css">
+	table, table th, table td {
+	  border-collapse: collapse;
+	  border: 1px solid;
+	  font-size: 10pt;
+	  text-align: center;
+	  padding: 2px 4px;
+	}
+	.num-label {
+	  width: 60px;
+	}
+	#occupancy-grid rect {
+	  stroke: black;
+	  fill: red;
+	}
+	#april-tag-def rect {
+	  stroke-width: 0.001;
+	  stroke: black;
+	  fill: #AAAAAA;
+	}
+	.robot-chassis {
+	  stroke-width: 0.002;
+	  stroke: black;
+	  fill: #3399FF;
+	}
+	.robot-wheels {
+	  stroke: none;
+	  fill: black;
+	}
+	.visual-field {
+	  stroke-width: 0.002;
+	  stroke: black;
+	  fill: #888888;
+	  opacity: 0.5;
+	  pointer-events: none;
+	}
+	.warning {
+	  fill: red;
+	  font-size: 12pt;
+	}
+</style>
+</head>
+
+<body>
+	<table id="status-and-controls">
+		<tr>
+			<th>Connection Status</th>
+			<th colspan="2">Commanded Velocity</th>
+			<th>IMU</th>
+			<th>Image</th>
+		</tr>
+		<tr>
+			<td>
+				<p id="connecting">Connecting to rosbridge...</p>
+				<p id="connected" style="color: #00D600; display: none">Connected!</p>
+				<p id="error" style="color: #FF0000; display: none">Some sort of error has occurred!</p>
+				<p id="closed" style="display: none">Connection closed.</p>
+			</td>
+			<td><div id="vel-guage-holder"></div></td>
+			<td><div id="omega-guage-holder"></div></td>
+			<td><div id="imu-guage-holder"></div></td>
+			<td><img id="tag-detections"/></td>
+		</tr>
+	</table>
+	<br/>
+	<table id="page-divider">
+		<tr>
+			<th>Tags</th>
+			<th>Map</th>
+		</tr>
+		<tr>
+			<td>
+				<table id="tag-data">
+					<tr>
+						<th rowspan="2">Tag id</th>
+						<th colspan="3">Pose</th>
+						<th colspan="4">Orientation</th>
+					</tr>
+					<tr>
+						<th class="num-label">x</th>
+						<th class="num-label">y</th>
+						<th class="num-label">z</th>
+						<th class="num-label">x</th>
+						<th class="num-label">y</th>
+						<th class="num-label">z</th>
+						<th class="num-label">w</th>
+					</tr>
+				</table>
+			</td>
+			<td>
+				<div id="map-holder">
+					<svg id="map" xmlns="http://www.w3.org/2000/svg">
+						<!-- Approximate shape scale: 1 SVG pixel = 1mm in the robot world. -->
+						<defs>
+							<g id="april-tag-def">
+								<rect x="-0.0" y="-0.05" width="0.02" height="0.1"/>
+								<rect x="-0.01" y="-0.02" width="0.01" height="0.04"/>
+							</g>
+							<g id="robot-def">
+								<rect class="robot-wheels" x="-0.003" y="-0.047" width="0.006" height="0.094" />
+								<rect class="robot-wheels" id="left-wheel"  x="-0.032" y="-0.054" width="0.06" height="0.007" />
+								<rect class="robot-wheels" id="right-wheel" x="-0.032" y="0.047"  width="0.06" height="0.007" />
+								<polygon class="robot-chassis" points="-0.03,-0.037 0.124,-0.037 0.154,-0.022 0.154,0.022 0.124,0.037 -0.03,0.037"/>
+								<g class="visual-field" transform="translate(0.154,0)">
+									<path d="M0,0 L0.8,0.6 A1.0,1.0 0,0 0.8,-0.6 L0,0"/>
+								</g>
+							</g>
+						</defs>
+						<g id="messages">
+							<text id="no-map-message" x="10" y="50" class="warning">No Map Data Received</text>
+						</g>
+						<g id="occupancy-grid"/>
+						<g id="real-world">
+							<g id="april-tags"/>
+							<g id="robot" transform="translate(-1000, -1000)">
+								<use xlink:href="#robot-def"/>
+								<title>Robot</title>
+							</g>
+						</g>
+					</svg>
+				</div>
+			</td>
+		</tr>
+	</table>
+	
+</body>
+</html>
